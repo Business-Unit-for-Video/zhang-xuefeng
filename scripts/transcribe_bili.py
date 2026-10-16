@@ -43,6 +43,8 @@ TRANSCRIBE_CHUNKED = os.getenv("TRANSCRIBE_CHUNKED", "0").strip().lower() in {"1
 MAX_TRAILING_GAP_SECONDS = float(os.getenv("MAX_TRAILING_GAP_SECONDS", "120"))
 MAX_TRAILING_GAP_RATIO = float(os.getenv("MAX_TRAILING_GAP_RATIO", "0.10"))
 GIT_BRANCH = os.getenv("GITHUB_REF_NAME", "").strip()
+_refresh_queue_value = os.getenv("REFRESH_QUEUE", "").strip().lower()
+REFRESH_QUEUE = _refresh_queue_value not in {"0", "false", "no", "off"}
 
 
 def log(msg: str):
@@ -120,6 +122,13 @@ def format_video_url(entry: Dict) -> Optional[str]:
     if url.startswith("BV"):
         return f"https://www.bilibili.com/video/{url}"
     return None
+
+
+def extract_bvid(value: object) -> str:
+    """Return a BVID found in an extractor id or URL."""
+    text = str(value or "")
+    match = re.search(r"(?<![0-9A-Za-z])(BV[0-9A-Za-z]+)(?![0-9A-Za-z])", text)
+    return match.group(1) if match else ""
 
 
 def save_progress(status: str, note: str = "", current: Optional[Dict] = None, queue_total: int = 0, queue_index: int = 0):
@@ -212,12 +221,55 @@ def extract_queue_from_space() -> List[Dict]:
     return queue
 
 
+def merge_queues(existing: List[Dict], discovered: List[Dict]) -> tuple[List[Dict], int]:
+    """Append newly discovered BVIDs while preserving the historical queue order."""
+    merged: List[Dict] = []
+    seen = set()
+
+    for item in existing:
+        if not isinstance(item, dict):
+            continue
+        bvid = extract_bvid(item.get("id")) or extract_bvid(item.get("url"))
+        if not bvid or bvid in seen:
+            continue
+        merged.append(item)
+        seen.add(bvid)
+
+    added = 0
+    for item in discovered:
+        if not isinstance(item, dict):
+            continue
+        bvid = extract_bvid(item.get("id")) or extract_bvid(item.get("url"))
+        if not bvid or bvid in seen:
+            continue
+        merged.append(item)
+        seen.add(bvid)
+        added += 1
+
+    return merged, added
+
+
 def load_or_build_queue() -> List[Dict]:
-    if QUEUE_FILE.exists():
-        queue = load_json(QUEUE_FILE, [])
-        if queue:
-            log(f"[info] loaded queue from state: {len(queue)} items")
-            return queue
+    existing = load_json(QUEUE_FILE, []) if QUEUE_FILE.exists() else []
+    if existing:
+        if not REFRESH_QUEUE:
+            log(f"[info] loaded queue from state: {len(existing)} items")
+            return existing
+
+        log("[discover] refreshing Bilibili space queue")
+        try:
+            discovered = extract_queue_from_space()
+        except Exception as exc:
+            log(f"[warn] queue refresh failed; keeping existing queue: {exc}")
+            return existing
+
+        merged, added = merge_queues(existing, discovered)
+        if added:
+            save_json(QUEUE_FILE, merged)
+            log(f"[info] queue refreshed: {len(existing)} existing, {added} new, {len(merged)} total")
+        else:
+            log(f"[info] queue refresh found no new videos: {len(existing)} items")
+        return merged
 
     log("[info] building queue from bilibili space")
     queue = extract_queue_from_space()
